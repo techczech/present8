@@ -45,11 +45,13 @@ final class RemoteServer {
                 return
             }
             let request = String(data: data, encoding: .utf8) ?? ""
-            let response = self.route(request)
-            let responseData = Data(response.utf8)
-            connection.send(content: responseData, completion: .contentProcessed { _ in
-                connection.cancel()
-            })
+            Task { @MainActor in
+                let response = self.route(request)
+                let responseData = Data(response.utf8)
+                connection.send(content: responseData, completion: .contentProcessed { _ in
+                    connection.cancel()
+                })
+            }
         }
     }
 
@@ -98,10 +100,17 @@ final class RemoteServer {
 
     private func statusResponse() -> String {
         let index = state?.currentIndex ?? 0
-        let total = state?.slides.count ?? 0
+        let total = state?.totalPresentableCount ?? 0
         let presenting = state?.isPresenting ?? false
-        let slideURL = (state?.currentSlide?.url ?? "").replacingOccurrences(of: "\"", with: "\\\"")
-        let body = "{\"slide\":\(index + 1),\"total\":\(total),\"presenting\":\(presenting),\"url\":\"\(slideURL)\"}"
+        let slideURL = state?.currentSlide?.sourceURLString ?? ""
+        let payload: [String: Any] = [
+            "slide": total == 0 ? 0 : index + 1,
+            "total": total,
+            "presenting": presenting,
+            "url": slideURL
+        ]
+        let bodyData = (try? JSONSerialization.data(withJSONObject: payload, options: [])) ?? Data("{}".utf8)
+        let body = String(data: bodyData, encoding: .utf8) ?? "{}"
         return "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
     }
 

@@ -9,21 +9,25 @@ struct PresentationView: View {
         ZStack {
             Color.black
 
-            if let slide = state.currentSlide {
-                WebView(url: slide.url, pageZoom: state.zoomLevel)
+            if let item = state.currentPresentableItem {
+                WebView(
+                    item: item,
+                    pageZoom: state.zoomLevel,
+                    deckBaseURL: state.loadedDeckURL?.deletingLastPathComponent(),
+                    bookmarks: state.bookmarks
+                )
             } else {
                 Text("No slides")
                     .foregroundStyle(.white)
                     .font(.largeTitle)
             }
 
-            // Slide counter overlay
-            if !state.slides.isEmpty {
+            if state.totalPresentableCount > 0 {
                 VStack {
                     Spacer()
                     HStack {
                         Spacer()
-                        Text("\(state.currentIndex + 1) / \(state.slides.count)")
+                        Text("\(state.currentIndex + 1) / \(state.totalPresentableCount)")
                             .font(.caption)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 4)
@@ -40,11 +44,19 @@ struct PresentationView: View {
     }
 }
 
-class PresentationWindowController {
+@MainActor
+final class PresentationWindowController {
     private var window: NSWindow?
     private var monitor: Any?
 
     func open(state: PresentationState) {
+        guard window == nil else {
+            window?.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        state.prepareForPresentation()
+
         let presentationView = PresentationView(state: state) { [weak self] in
             self?.close(state: state)
         }
@@ -67,26 +79,31 @@ class PresentationWindowController {
 
         self.window = window
 
-        // Key event monitor
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             let cmd = event.modifierFlags.contains(.command)
             switch event.keyCode {
-            case 123: // Left arrow
+            case 123:
                 state.goToPrevious()
                 return nil
-            case 124: // Right arrow
+            case 124:
                 state.goToNext()
                 return nil
-            case 53: // Escape
+            case 53:
                 self?.close(state: state)
                 return nil
-            case 24, 69 where cmd: // Cmd+= / Cmd+Numpad+
+            case 24 where cmd:
                 state.zoomIn()
                 return nil
-            case 27, 78 where cmd: // Cmd+- / Cmd+Numpad-
+            case 69 where cmd:
+                state.zoomIn()
+                return nil
+            case 27 where cmd:
                 state.zoomOut()
                 return nil
-            case 29 where cmd: // Cmd+0
+            case 78 where cmd:
+                state.zoomOut()
+                return nil
+            case 29 where cmd:
                 state.zoomReset()
                 return nil
             default:

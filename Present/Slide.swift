@@ -292,11 +292,15 @@ final class PresentationState {
     var loadedDeckURL: URL? = nil
 
     let bookmarks = SandboxBookmarks()
+    let screenshotStore = SlideScreenshotStore()
     private let cacheWarmer = CacheWarmer()
+    private let screenshotWarmer = SlideScreenshotWarmer()
 
     private static let autosaveMarkdownKey = "presentAutosavedDeckMarkdown"
     private static let autosaveDeckSourcePathKey = "presentAutosavedDeckSourcePath"
     private static let legacyAutosaveKey = "presentAutosavedURLs"
+    private static let mainDeckFileName = "presentation.md"
+    private static let screenshotsFolderName = "screenshots"
 
     init() {
         let restoredSourceURL: URL?
@@ -355,6 +359,18 @@ final class PresentationState {
 
     var currentSlide: DeckItem? {
         currentPresentableItem
+    }
+
+    var deckFolderURL: URL? {
+        loadedDeckURL?.deletingLastPathComponent()
+    }
+
+    var mainDeckFileURL: URL? {
+        deckFolderURL?.appendingPathComponent(Self.mainDeckFileName, isDirectory: false)
+    }
+
+    var screenshotsFolderURL: URL? {
+        deckFolderURL?.appendingPathComponent(Self.screenshotsFolderName, isDirectory: true)
     }
 
     func zoomIn() { zoomLevel = min(zoomLevel + 0.1, 5.0) }
@@ -421,15 +437,24 @@ final class PresentationState {
 
     func markDirtyAndSave() {
         saveToDisk()
+        screenshotWarmer.warm(
+            items: presentableItems,
+            deckBaseURL: deckFolderURL,
+            bookmarks: bookmarks,
+            screenshotStore: screenshotStore
+        )
     }
 
     func applyLoadedDeck(_ newDeck: Deck, sourceURL: URL?) {
         deck = newDeck
         if let sourceURL {
-            loadedDeckURL = sourceURL
+            loadedDeckURL = sourceURL.standardizedFileURL
         }
         ensureNonEmptyDeck()
         syncSelectionToCurrentItem()
+        if let folderURL = deckFolderURL {
+            _ = screenshotStore.ensureScreenshotsDirectory(in: folderURL)
+        }
         saveToDisk()
         triggerCacheWarmup()
     }
@@ -448,11 +473,13 @@ final class PresentationState {
     }
 
     func loadFromFile(_ url: URL) -> Bool {
-        guard let contents = try? String(contentsOf: url, encoding: .utf8) else { return false }
+        let standardizedURL = url.standardizedFileURL
+        _ = bookmarks.storeAccess(for: standardizedURL.deletingLastPathComponent())
+        guard let contents = try? String(contentsOf: standardizedURL, encoding: .utf8) else { return false }
 
         let deckFromFile: Deck
-        if url.pathExtension.lowercased() == "md" {
-            deckFromFile = DeckMarkdownParser.parseMarkdown(contents, sourceURL: url)
+        if standardizedURL.pathExtension.lowercased() == "md" {
+            deckFromFile = DeckMarkdownParser.parseMarkdown(contents, sourceURL: standardizedURL)
         } else {
             let urls = contents
                 .components(separatedBy: .newlines)
@@ -462,18 +489,51 @@ final class PresentationState {
             deckFromFile = DeckMarkdownParser.parseLegacyURLList(urls)
         }
 
-        applyLoadedDeck(deckFromFile, sourceURL: url)
+        applyLoadedDeck(deckFromFile, sourceURL: standardizedURL)
         return true
     }
 
     func saveToFile(_ url: URL) -> Bool {
+        let standardizedURL = url.standardizedFileURL
+        _ = bookmarks.storeAccess(for: standardizedURL.deletingLastPathComponent())
         let markdown = DeckMarkdownParser.serialize(deck: deck)
         do {
-            try markdown.write(to: url, atomically: true, encoding: .utf8)
+            try markdown.write(to: standardizedURL, atomically: true, encoding: .utf8)
+            loadedDeckURL = standardizedURL
+            if let folderURL = deckFolderURL {
+                _ = screenshotStore.ensureScreenshotsDirectory(in: folderURL)
+            }
+            saveToDisk()
+            triggerCacheWarmup()
             return true
         } catch {
             return false
         }
+    }
+
+    func openDeckFolder(_ folderURL: URL) -> Bool {
+        let standardizedFolder = folderURL.standardizedFileURL
+        _ = bookmarks.storeAccess(for: standardizedFolder)
+        let mainDeckURL = standardizedFolder.appendingPathComponent(Self.mainDeckFileName, isDirectory: false)
+
+        if FileManager.default.fileExists(atPath: mainDeckURL.path) {
+            return loadFromFile(mainDeckURL)
+        }
+
+        applyLoadedDeck(Deck(sections: [DeckSection(title: "Slides")]), sourceURL: mainDeckURL)
+        return saveToFile(mainDeckURL)
+    }
+
+    func saveDeck() -> Bool {
+        guard let mainDeckFileURL else { return false }
+        return saveToFile(mainDeckFileURL)
+    }
+
+    func saveDeckToFolder(_ folderURL: URL) -> Bool {
+        let standardizedFolder = folderURL.standardizedFileURL
+        _ = bookmarks.storeAccess(for: standardizedFolder)
+        let mainDeckURL = standardizedFolder.appendingPathComponent(Self.mainDeckFileName, isDirectory: false)
+        return saveToFile(mainDeckURL)
     }
 
     func resolveLocalPath(_ path: String) -> URL {
@@ -484,17 +544,54 @@ final class PresentationState {
         if raw.hasPrefix("/") {
             return URL(fileURLWithPath: raw)
         }
-        if let baseURL = loadedDeckURL?.deletingLastPathComponent() {
+        if let baseURL = deckFolderURL {
             return URL(fileURLWithPath: raw, relativeTo: baseURL).standardizedFileURL
         }
         return URL(fileURLWithPath: raw).standardizedFileURL
     }
 
+    func previewInfo(relativeOffset: Int, routePath: String) -> (available: Bool, url: String) {
+        guard let item = presentableItem(relativeOffset: relativeOffset),
+              let deckFolderURL,
+              screenshotStore.existingScreenshotURL(for: item, deckFolderURL: deckFolderURL) != nil else {
+            return (false, "")
+        }
+
+        let token = screenshotStore.previewToken(for: item)
+        return (true, "\(routePath)?v=\(token)")
+    }
+
+    func previewImageData(relativeOffset: Int) -> Data? {
+        guard let item = presentableItem(relativeOffset: relativeOffset),
+              let deckFolderURL,
+              let screenshotURL = screenshotStore.existingScreenshotURL(for: item, deckFolderURL: deckFolderURL) else {
+            return nil
+        }
+
+        let accessibleURL = bookmarks.resolveAccessibleURL(for: screenshotURL) ?? screenshotURL
+        return try? Data(contentsOf: accessibleURL)
+    }
+
     func triggerCacheWarmup() {
         cacheWarmer.warm(items: presentableItems)
+        screenshotWarmer.warm(
+            items: presentableItems,
+            deckBaseURL: deckFolderURL,
+            bookmarks: bookmarks,
+            screenshotStore: screenshotStore
+        )
     }
 
     func prepareForPresentation() {
         triggerCacheWarmup()
+    }
+
+    private func presentableItem(relativeOffset: Int) -> DeckItem? {
+        let items = presentableItems
+        guard !items.isEmpty else { return nil }
+
+        let base = currentIndex
+        let wrapped = ((base + relativeOffset) % items.count + items.count) % items.count
+        return items[wrapped]
     }
 }

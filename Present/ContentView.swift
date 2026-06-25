@@ -172,8 +172,9 @@ struct ContentView: View {
                 WebView(
                     item: item,
                     pageZoom: state.zoomLevel,
-                    deckBaseURL: state.loadedDeckURL?.deletingLastPathComponent(),
-                    bookmarks: state.bookmarks
+                    deckBaseURL: state.deckFolderURL,
+                    bookmarks: state.bookmarks,
+                    screenshotStore: state.screenshotStore
                 )
             } else {
                 VStack {

@@ -2,8 +2,21 @@
 
 A macOS SwiftUI app for giving presentations where each slide is a URL displayed in a WebView.
 
+> [!IMPORTANT]
+> This repository is now the legacy implementation. Active development has moved to `../present8on`, the Electron rewrite of the app. Use this repo as a behavior reference for the original SwiftUI/WKWebView implementation unless a task explicitly requires changes here.
+
 > [!WARNING]  
 > This app was vibe coded as a demo for a conference (where I presented a talk using this app). Here's [part of the transcript](https://gisthost.github.io/?bfbc338977ceb71e298e4d4d5ac7d63c). I do not know Swift or SwiftUI. I make no promises other than it worked on my machine!
+
+## Repository Status
+
+- Status: legacy reference repo
+- Active successor: `../present8on`
+- Use this repo to verify the original behavior of:
+  - deck parsing and markdown conventions
+  - `WKWebView` behavior for YouTube and X/Twitter slides
+  - mobile remote HTTP routes and presentation semantics
+- Avoid new feature work here unless the task specifically targets the Swift app
 
 ## Features
 
@@ -81,7 +94,7 @@ https://github.com
 https://simonwillison.net
 ```
 
-## Code walkthrough
+## Code Walkthrough
 
 See [walkthrough.md](walkthrough.md) for a detailed walkthrough of the codebase.
 

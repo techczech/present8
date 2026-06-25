@@ -7,9 +7,10 @@ struct WebView: NSViewRepresentable {
     var pageZoom: Double = 1.0
     var deckBaseURL: URL?
     let bookmarks: SandboxBookmarks
+    let screenshotStore: SlideScreenshotStore
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(bookmarks: bookmarks)
+        Coordinator(bookmarks: bookmarks, screenshotStore: screenshotStore)
     }
 
     func makeNSView(context: Context) -> WKWebView {
@@ -34,6 +35,7 @@ struct WebView: NSViewRepresentable {
 
     private func applyContent(in webView: WKWebView, coordinator: Coordinator) {
         coordinator.currentDeckBaseURL = deckBaseURL
+        coordinator.currentItem = item
 
         let key = item.cacheKey
         if coordinator.lastLoadedKey == key {
@@ -47,29 +49,40 @@ struct WebView: NSViewRepresentable {
         switch item.kind {
         case .web(let rawURL):
             coordinator.resetYouTubeTracking()
+            coordinator.prepareForNetworkSlide()
             loadWeb(rawURL, in: webView, coordinator: coordinator)
 
         case .text(let heading, let markdown):
             coordinator.resetYouTubeTracking()
+            coordinator.prepareForNonNetworkSlide()
             let html = Self.textSlideHTML(heading: heading, markdownBody: markdown)
             webView.loadHTMLString(html, baseURL: nil)
 
         case .tweet(let tweetURL):
             coordinator.resetYouTubeTracking()
-            coordinator.loadTweetEmbed(tweetURL: tweetURL, cacheKey: key, pageZoom: pageZoom)
+            coordinator.prepareForNetworkSlide()
+            coordinator.loadTweetEmbed(item: item, tweetURL: tweetURL, cacheKey: key, pageZoom: pageZoom)
 
         case .youtube(let youtubeURL, let fallbackPath):
+            coordinator.prepareForNetworkSlide()
             coordinator.startYouTubePlayback(youtubeURL: youtubeURL, fallbackPath: fallbackPath, pageZoom: pageZoom)
 
         case .localMedia(let path, let mediaType):
             coordinator.resetYouTubeTracking()
+            coordinator.prepareForNonNetworkSlide()
             coordinator.loadLocalMedia(path: path, mediaType: mediaType)
         }
     }
 
     private func loadWeb(_ rawURL: String, in webView: WKWebView, coordinator: Coordinator) {
         if Self.isImageURL(rawURL) {
-            let resolved = Self.resolveURLString(rawURL)
+            let source: String
+            if let localImageURL = coordinator.resolveAccessibleFileURLIfLikelyLocal(for: rawURL, promptIfNeeded: true) {
+                source = localImageURL.absoluteString
+            } else {
+                source = Self.resolveURLString(rawURL)
+            }
+
             let html = """
             <!DOCTYPE html>
             <html><head><meta name=\"viewport\" content=\"width=device-width\">
@@ -78,14 +91,21 @@ struct WebView: NSViewRepresentable {
             body { background: #000; display: flex; align-items: center; justify-content: center; width: 100vw; height: 100vh; }
             img { max-width: 100vw; max-height: 100vh; object-fit: contain; }
             </style>
-            </head><body><img src=\"\(Self.escapeHTMLAttribute(resolved))\" alt=\"slide\"></body></html>
+            </head><body><img src=\"\(Self.escapeHTMLAttribute(source))\" alt=\"slide\"></body></html>
             """
             webView.loadHTMLString(html, baseURL: nil)
             return
         }
 
+        if let localURL = coordinator.resolveAccessibleFileURLIfLikelyLocal(for: rawURL, promptIfNeeded: true) {
+            webView.loadFileURL(localURL, allowingReadAccessTo: localURL.deletingLastPathComponent())
+            return
+        }
+
         guard let parsed = Self.resolvedURL(from: rawURL) else {
-            webView.loadHTMLString(Self.errorHTML(message: "Invalid URL: \(rawURL)"), baseURL: nil)
+            if !coordinator.tryLoadScreenshotFallback() {
+                webView.loadHTMLString(Self.errorHTML(message: "Invalid URL: \(rawURL)"), baseURL: nil)
+            }
             return
         }
 
@@ -104,7 +124,7 @@ struct WebView: NSViewRepresentable {
             lower.hasSuffix(".svg")
     }
 
-    private static func resolvedURL(from raw: String) -> URL? {
+    static func resolvedURL(from raw: String) -> URL? {
         if let parsed = URL(string: raw), parsed.scheme != nil {
             return parsed
         }
@@ -323,13 +343,18 @@ struct WebView: NSViewRepresentable {
         var isAwaitingYouTubeEmbedResult = false
         var didFallbackToYouTubeWatchPage = false
         var currentDeckBaseURL: URL?
+        var currentItem: DeckItem?
 
         private let bookmarks: SandboxBookmarks
+        private let screenshotStore: SlideScreenshotStore
         private var observer: NSObjectProtocol?
         private var activeTweetCacheKey: String?
+        private var hasAttemptedScreenshotFallback = false
+        private var isNetworkBackedSlide = false
 
-        init(bookmarks: SandboxBookmarks) {
+        init(bookmarks: SandboxBookmarks, screenshotStore: SlideScreenshotStore) {
             self.bookmarks = bookmarks
+            self.screenshotStore = screenshotStore
         }
 
         func resetYouTubeTracking() {
@@ -337,6 +362,16 @@ struct WebView: NSViewRepresentable {
             pendingYouTubeWatchURL = nil
             isAwaitingYouTubeEmbedResult = false
             didFallbackToYouTubeWatchPage = false
+        }
+
+        func prepareForNetworkSlide() {
+            isNetworkBackedSlide = true
+            hasAttemptedScreenshotFallback = false
+        }
+
+        func prepareForNonNetworkSlide() {
+            isNetworkBackedSlide = false
+            hasAttemptedScreenshotFallback = true
         }
 
         func startYouTubePlayback(youtubeURL: String, fallbackPath: String?, pageZoom: Double) {
@@ -360,7 +395,7 @@ struct WebView: NSViewRepresentable {
                 webView.load(youtubeRequest(for: fallbackWatchURL, cachePolicy: .returnCacheDataElseLoad, timeoutInterval: 20.0))
             } else if let fallbackPath {
                 loadLocalMedia(path: fallbackPath, mediaType: DeckMarkdownParser.mediaType(for: fallbackPath) ?? .video)
-            } else {
+            } else if !tryLoadScreenshotFallback() {
                 webView.loadHTMLString(WebView.errorHTML(message: "Invalid YouTube URL"), baseURL: nil)
             }
         }
@@ -378,14 +413,17 @@ struct WebView: NSViewRepresentable {
             }
         }
 
-        func loadTweetEmbed(tweetURL: String, cacheKey: String, pageZoom: Double) {
+        func loadTweetEmbed(item: DeckItem, tweetURL: String, cacheKey: String, pageZoom: Double) {
             guard let webView else { return }
             webView.pageZoom = pageZoom
             activeTweetCacheKey = cacheKey
+            currentItem = item
 
             guard let encoded = tweetURL.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
                   let endpoint = URL(string: "https://publish.twitter.com/oembed?omit_script=false&url=\(encoded)") else {
-                webView.loadHTMLString(WebView.tweetFallbackHTML(tweetURL: tweetURL), baseURL: nil)
+                if !tryLoadScreenshotFallback() {
+                    webView.loadHTMLString(WebView.tweetFallbackHTML(tweetURL: tweetURL), baseURL: nil)
+                }
                 return
             }
 
@@ -406,7 +444,7 @@ struct WebView: NSViewRepresentable {
 
                     if let html {
                         webView.loadHTMLString(WebView.tweetWrapperHTML(embedHTML: html), baseURL: nil)
-                    } else {
+                    } else if !self.tryLoadScreenshotFallback() {
                         webView.loadHTMLString(WebView.tweetFallbackHTML(tweetURL: tweetURL), baseURL: nil)
                     }
                 }
@@ -416,7 +454,7 @@ struct WebView: NSViewRepresentable {
         func loadLocalMedia(path: String, mediaType: DeckMediaType) {
             guard let webView else { return }
 
-            guard let fileURL = resolveAccessibleFileURL(for: path) else {
+            guard let fileURL = resolveAccessibleFileURL(for: path, promptIfNeeded: true) else {
                 webView.loadHTMLString(WebView.errorHTML(message: "Cannot access local media file: \(path)"), baseURL: nil)
                 return
             }
@@ -425,15 +463,36 @@ struct WebView: NSViewRepresentable {
             webView.loadHTMLString(html, baseURL: fileURL.deletingLastPathComponent())
         }
 
-        private func resolveAccessibleFileURL(for rawPath: String) -> URL? {
+        func resolveAccessibleFileURLIfLikelyLocal(for rawPath: String, promptIfNeeded: Bool) -> URL? {
+            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+
+            if trimmed.hasPrefix("file://") || trimmed.hasPrefix("/") || trimmed.hasPrefix("./") || trimmed.hasPrefix("../") {
+                return resolveAccessibleFileURL(for: trimmed, promptIfNeeded: promptIfNeeded)
+            }
+
+            if trimmed.contains("://") {
+                return nil
+            }
+
+            guard let base = currentDeckBaseURL else { return nil }
+            let candidate = URL(fileURLWithPath: trimmed, relativeTo: base).standardizedFileURL
+            guard FileManager.default.fileExists(atPath: candidate.path) else {
+                return nil
+            }
+
+            return resolveAccessibleFileURL(for: trimmed, promptIfNeeded: promptIfNeeded)
+        }
+
+        private func resolveAccessibleFileURL(for rawPath: String, promptIfNeeded: Bool) -> URL? {
             let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { return nil }
 
             let suggestedURL: URL
             if trimmed.hasPrefix("file://"), let parsed = URL(string: trimmed) {
-                suggestedURL = parsed
+                suggestedURL = parsed.standardizedFileURL
             } else if trimmed.hasPrefix("/") {
-                suggestedURL = URL(fileURLWithPath: trimmed)
+                suggestedURL = URL(fileURLWithPath: trimmed).standardizedFileURL
             } else if let base = currentDeckBaseURL {
                 suggestedURL = URL(fileURLWithPath: trimmed, relativeTo: base).standardizedFileURL
             } else {
@@ -444,11 +503,31 @@ struct WebView: NSViewRepresentable {
                 return accessible
             }
 
+            guard promptIfNeeded else {
+                return nil
+            }
+
             return bookmarks.promptAndStoreAccess(for: suggestedURL)
         }
 
-        private func handlePotentialYouTubeFallback() {
-            guard let webView else { return }
+        func tryLoadScreenshotFallback() -> Bool {
+            guard !hasAttemptedScreenshotFallback,
+                  isNetworkBackedSlide,
+                  let item = currentItem,
+                  let deckFolderURL = currentDeckBaseURL,
+                  let screenshotURL = screenshotStore.existingScreenshotURL(for: item, deckFolderURL: deckFolderURL),
+                  let webView else {
+                return false
+            }
+
+            hasAttemptedScreenshotFallback = true
+            webView.loadFileURL(screenshotURL, allowingReadAccessTo: screenshotURL.deletingLastPathComponent())
+            return true
+        }
+
+        @discardableResult
+        private func handlePotentialYouTubeFallback() -> Bool {
+            guard let webView else { return false }
 
             if isAwaitingYouTubeEmbedResult {
                 isAwaitingYouTubeEmbedResult = false
@@ -456,26 +535,34 @@ struct WebView: NSViewRepresentable {
                     didFallbackToYouTubeWatchPage = true
                     // Full watch page fallback allows normal YouTube login/session.
                     webView.load(youtubeRequest(for: watchURL, cachePolicy: .useProtocolCachePolicy, timeoutInterval: 20.0))
-                    return
+                    return true
                 }
             }
 
             guard let fallbackPath = pendingYouTubeFallbackPath,
                   !fallbackPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                return
+                return false
             }
 
             let mediaType = DeckMarkdownParser.mediaType(for: fallbackPath) ?? .video
             loadLocalMedia(path: fallbackPath, mediaType: mediaType)
             pendingYouTubeFallbackPath = nil
+            return true
+        }
+
+        private func handleNavigationFailure() {
+            if handlePotentialYouTubeFallback() {
+                return
+            }
+            _ = tryLoadScreenshotFallback()
         }
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-            handlePotentialYouTubeFallback()
+            handleNavigationFailure()
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-            handlePotentialYouTubeFallback()
+            handleNavigationFailure()
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -496,7 +583,9 @@ struct WebView: NSViewRepresentable {
 
                 let inspected = (result as? String)?.lowercased() ?? ""
                 if self.shouldFallbackFromYouTubeEmbed(inspected) {
-                    self.handlePotentialYouTubeFallback()
+                    if !self.handlePotentialYouTubeFallback() {
+                        _ = self.tryLoadScreenshotFallback()
+                    }
                 } else {
                     self.isAwaitingYouTubeEmbedResult = false
                 }

@@ -1,6 +1,5 @@
 import SwiftUI
 import Combine
-import UniformTypeIdentifiers
 import AppKit
 import WebKit
 
@@ -35,15 +34,20 @@ struct PresentApp: App {
         .commands {
             CommandGroup(after: .newItem) {
                 Divider()
-                Button("Open...") {
-                    FileDialogHelper.open(state: state)
+                Button("Open Deck Folder...") {
+                    FileDialogHelper.openDeckFolder(state: state)
                 }
                 .keyboardShortcut("o", modifiers: .command)
 
-                Button("Save As...") {
-                    FileDialogHelper.save(state: state)
+                Button("Save Deck") {
+                    FileDialogHelper.saveDeck(state: state)
                 }
                 .keyboardShortcut("s", modifiers: .command)
+
+                Button("Save Deck Folder As...") {
+                    FileDialogHelper.saveDeckAsFolder(state: state)
+                }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
             }
 
             CommandMenu("View") {
@@ -88,24 +92,35 @@ struct PresentApp: App {
 
 enum FileDialogHelper {
     @MainActor
-    static func open(state: PresentationState) {
+    static func openDeckFolder(state: PresentationState) {
         let panel = NSOpenPanel()
-        let markdownType = UTType(filenameExtension: "md") ?? .plainText
-        panel.allowedContentTypes = [.plainText, markdownType]
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
         panel.allowsMultipleSelection = false
+        panel.directoryURL = state.deckFolderURL
         if panel.runModal() == .OK, let url = panel.url {
-            _ = state.loadFromFile(url)
+            _ = state.openDeckFolder(url)
         }
     }
 
     @MainActor
-    static func save(state: PresentationState) {
-        let panel = NSSavePanel()
-        let markdownType = UTType(filenameExtension: "md") ?? .plainText
-        panel.allowedContentTypes = [markdownType]
-        panel.nameFieldStringValue = "presentation.md"
-        if panel.runModal() == .OK, let url = panel.url {
-            _ = state.saveToFile(url)
+    static func saveDeck(state: PresentationState) {
+        if !state.saveDeck() {
+            saveDeckAsFolder(state: state)
+        }
+    }
+
+    @MainActor
+    static func saveDeckAsFolder(state: PresentationState) {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = state.deckFolderURL
+        if panel.runModal() == .OK, let folderURL = panel.url {
+            _ = state.saveDeckToFolder(folderURL)
         }
     }
 }
